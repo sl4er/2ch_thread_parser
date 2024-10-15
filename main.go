@@ -9,68 +9,106 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
+)
 
-	"github.com/gocolly/colly"
+var (
+	title         = "### 2CH THREAD PARSER ###"
+	pattern       = `^(https?|http)://[^\s/$.?#].[^\s]*$`
+	re            = regexp.MustCompile(pattern)
+	maxConcurrent = 10
 )
 
 func main() {
-	fmt.Println("### 2CH THREAD PARSER ###")
-	maxConcurrent := 5 // Максимальное количество одновременных загрузок
-	var wg sync.WaitGroup
+	fmt.Println(title)
 	taskCh := make(chan string, maxConcurrent)
+	beforeAll := time.Now()
 
-	readUrls, _ := createConfigFile()
-	urlArray := [][]string{}
-	for _, url := range readUrls {
-		urlArray = append(urlArray, collectUrls(url))
+	readUrls, err := createConfigFile()
+	if err != nil {
+		fmt.Println(err)
+		return
 	}
+
+	var urlWg sync.WaitGroup
+	for _, site := range readUrls {
+		urlWg.Add(1)
+		go func(site string) {
+			defer urlWg.Done()
+			for _, v := range collectUrls(site) {
+				taskCh <- v
+			}
+		}(site)
+	}
+
+	go func() {
+		urlWg.Wait()
+		close(taskCh)
+	}()
+
+	var wg sync.WaitGroup
 	for i := 0; i < maxConcurrent; i++ {
 		wg.Add(1)
 		go worker(taskCh, &wg)
 	}
 
-	// Передача задач в канал
-	for _, site := range urlArray {
-		for _, url := range site {
-			taskCh <- url
-		}
-		fmt.Println("All files in", getThreadName(site[0]), "were downloaded")
-	}
-
-	close(taskCh) // Закрытие канала, чтобы завершить горутины-рабочие группы
-	wg.Wait()     // Ожидаем завершения всех горутин-рабочих групп
+	wg.Wait()
+	fmt.Println(maxConcurrent, "workers:", time.Since(beforeAll))
 	defer showAlert()
 }
 
 func worker(ch <-chan string, wg *sync.WaitGroup) {
-	defer wg.Done()
 	for url := range ch {
 		if err := downloadFile(url); err != nil {
-			fmt.Printf("Ошибка при загрузке: %v\n", err)
+			fmt.Printf("Downloading err: %v\n", err)
 		}
+		fmt.Printf("File was downloaded: %v\n", url)
 	}
+	defer wg.Done()
+}
+
+func collectUrls(url string) []string {
+	resp, err := http.Get(url)
+	if err != nil {
+		fmt.Println(err)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Println(err)
+		return nil
+	}
+	urlPrefix := "https://2ch.hk"
+	urlOfFiles := []string{}
+
+	re := regexp.MustCompile(`href="(/fag/src/\d+/\d+\.[^"]+)"`)
+	matches := re.FindAllStringSubmatch(string(body), -1)
+
+	for _, match := range matches {
+		value := urlPrefix + match[1]
+		urlOfFiles = append(urlOfFiles, value)
+	}
+
+	return urlOfFiles
 }
 
 func createConfigFile() ([]string, error) {
 	configName := "urls.txt"
-	urlsList := []string{}
-	if _, err := os.Stat(configName); err == nil {
+	if _, err := os.Stat(configName); !os.IsNotExist(err) {
 		data, err := os.ReadFile(configName)
 		if err != nil {
 			log.Fatal(err)
 		}
 		if len(data) == 0 {
 			fmt.Println("Add urls into config file -", configName, "!!!")
-		} else {
-			t := strings.Split(string(data), "\r\n")
-			for _, i := range t {
-				if isUrl(i) {
-					urlsList = append(urlsList, i)
-				} else {
-					fmt.Println(i, "is not valid URL!")
-				}
-			}
-		}
+			return nil, err
+		} 
+
+		urlList := createUrlList(data)
+		return urlList, nil
+		
 	} else {
 		fmt.Println("Config file with urls is not found and was created!")
 		file, err := os.Create(configName)
@@ -80,26 +118,25 @@ func createConfigFile() ([]string, error) {
 		defer file.Close()
 	}
 
-	return urlsList, nil
+	return nil, nil
 }
 
-func collectUrls(url string) []string {
-	urlPrefix := "https://2ch.hk"
+func createUrlList(data []byte) []string {
+	urlList := []string{}
+	lines := strings.Split(string(data), "\r\n")
 
-	c := colly.NewCollector(
-		colly.AllowedDomains("2ch.hk"),
-	)
-	urlOfFiles := []string{}
-
-	c.OnHTML("img", func(e *colly.HTMLElement) {
-		src := e.Attr("data-src")
-		if !strings.HasPrefix(src, "/stickers/") && len(src) != 0 {
-			value := urlPrefix + src
-			urlOfFiles = append(urlOfFiles, value)
+	for _, line := range lines {
+		if isUrl(line) {
+			urlList = append(urlList, line)
+		} else {
+			fmt.Println(line, "is not valid URL!")
 		}
-	})
-	c.Visit(url)
-	return urlOfFiles
+	}
+	return urlList
+}
+
+func isUrl(userUrl string) bool {
+	return re.MatchString(userUrl)
 }
 
 func getFilename(url string) string {
@@ -116,22 +153,11 @@ func getDirName(url string) string {
 	return r
 }
 
-func getThreadName(site string) string {
-	r := strings.Split(site, "/")
-	thread := strings.Join(r[:len(r)-1], "/")
-	return thread
-}
-
 func showAlert() {
 	fmt.Print("Press Enter to exit...")
 	fmt.Scanln()
 }
 
-func isUrl(userUrl string) bool {
-	pattern := `^(https?|http)://[^\s/$.?#].[^\s]*$`
-	re := regexp.MustCompile(pattern)
-	return re.MatchString(userUrl)
-}
 
 func downloadFile(url string) error {
 	firstUrl := url
@@ -139,7 +165,6 @@ func downloadFile(url string) error {
 	filename := getFilename(firstUrl)
 	filePath := fmt.Sprintf("%s/%s", dirname, filename)
 
-	// Проверяем, существует ли директория, и создаем ее, если она не существует
 	if _, err := os.Stat(dirname); os.IsNotExist(err) {
 		if err := os.MkdirAll(dirname, os.ModePerm); err != nil {
 			return err
