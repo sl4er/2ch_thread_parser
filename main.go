@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"regexp"
@@ -16,8 +15,10 @@ var (
 	title         = "### 2CH THREAD PARSER ###"
 	urlPattern    = `^(https?|http)://[^\s/$.?#].[^\s]*$`
 	re            = regexp.MustCompile(urlPattern)
+	client        = http.Client{Timeout: 30 * time.Second}
 	urlFileName   = "urls.txt"
 	maxConcurrent = 5
+	retries       = 5
 )
 
 func main() {
@@ -49,29 +50,45 @@ func main() {
 		close(taskCh)
 	}()
 
-	var wg sync.WaitGroup
+	var workerWg sync.WaitGroup
 	for i := 0; i < maxConcurrent; i++ {
-		wg.Add(1)
-		go worker(taskCh, &wg)
+		workerWg.Add(1)
+		go worker(taskCh, &workerWg)
 	}
 
-	wg.Wait()
+	workerWg.Wait()
 	fmt.Println(maxConcurrent, "workers:", time.Since(beforeAll))
-	defer showAlert()
+	showAlert()
 }
 
-func worker(ch <-chan string, wg *sync.WaitGroup) {
+func worker(ch chan string, wg *sync.WaitGroup) {
 	for url := range ch {
 		if err := downloadFile(url); err != nil {
 			fmt.Printf("Downloading err: %v\n", err)
+
+			if err = retryDownload(url); err != nil {
+				fmt.Println(err)
+				return
+			}
 		}
-		fmt.Printf("File was downloaded: %v\n", url)
 	}
 	defer wg.Done()
 }
 
+func retryDownload(url string) error {
+	for i := 1; i <= retries; i++ {
+		fmt.Printf("Retry download #%v - %v\n", i, url)
+		if err := downloadFile(url); err == nil {
+			fmt.Printf("Success retry download - %v\n", url)
+			return nil
+		}
+	}
+	return fmt.Errorf("failed to download %v", url)
+}
+
 func collectUrls(url string) map[string]struct{} {
-	resp, err := http.Get(url)
+	resp, err := client.Get(url)
+
 	if err != nil {
 		fmt.Println(err)
 		return nil
@@ -86,7 +103,7 @@ func collectUrls(url string) map[string]struct{} {
 	urlPrefix := "https://2ch.hk"
 	urlOfFiles := map[string]struct{}{}
 
-	re := regexp.MustCompile(`href="(/fag/src/\d+/\d+\.[^"]+)"`)
+	re := regexp.MustCompile(`href="(.*/src/\d+/\d+\.[^"]+)"`)
 	matches := re.FindAllStringSubmatch(string(body), -1)
 
 	for _, match := range matches {
@@ -96,6 +113,11 @@ func collectUrls(url string) map[string]struct{} {
 		}
 	}
 
+	if len(urlOfFiles) == 0 {
+		fmt.Println("map of URLs is empty")
+		return nil
+	}
+
 	return urlOfFiles
 }
 
@@ -103,7 +125,7 @@ func createConfigFile() ([]byte, error) {
 	if _, err := os.Stat(urlFileName); !os.IsNotExist(err) {
 		data, err := os.ReadFile(urlFileName)
 		if err != nil {
-			log.Fatal(err)
+			return nil, err
 		}
 		if len(data) == 0 {
 			return nil, fmt.Errorf("%v file is empty", urlFileName)
@@ -114,7 +136,7 @@ func createConfigFile() ([]byte, error) {
 
 	file, err := os.Create(urlFileName)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 	defer file.Close()
 
@@ -131,6 +153,11 @@ func createUrlList(data []byte) []string {
 		} else {
 			fmt.Println(line, "is not valid URL!")
 		}
+	}
+
+	if len(urlList) == 0 {
+		fmt.Println("config file doensn't conatain any valid URL")
+		return nil
 	}
 	return urlList
 }
@@ -168,7 +195,7 @@ func downloadFile(url string) error {
 		return nil
 	}
 
-	resp, err := http.Get(url)
+	resp, err := client.Get(url)
 	if err != nil {
 		return err
 	}
@@ -186,5 +213,6 @@ func downloadFile(url string) error {
 		return err
 	}
 
+	fmt.Printf("File was downloaded: %v\n", url)
 	return nil
 }
